@@ -7,24 +7,65 @@
 #include <netinet/in.h>
 #include <netdb.h>
 
-void error(const char *msg) { perror(msg); exit(0); } // Error function used for reporting issues
+void error(const char *msg) { perror(msg); exit(1); } // Error function used for reporting issues
 
 int main(int argc, char *argv[])
 {
 	int socketFD, portNumber, charsWritten, charsRead;
 	struct sockaddr_in serverAddress;
 	struct hostent* serverHostInfo;
-	char buffer[256];
+	size_t max_length = 80000;
+	char* message;
+	char* key;
+	char* newline;
+	FILE* file;
 
-	if (argc < 3) { fprintf(stderr,"USAGE: %s hostname port\n", argv[0]); exit(0); } // Check usage & args
+	if (argc != 4) { fprintf(stderr,"USAGE: %s cyphertext key port\n", argv[0]); fflush(stderr); exit(1); } // Check usage & args
+
+	// Get cyphertext from file
+	message = (char*)malloc(sizeof(char) * max_length);
+	memset(message, '\0', max_length);
+	file = fopen(argv[1], "r");
+	if (!file) { fprintf(stderr,"CLIENT: ERROR opening file %s\n", argv[1]); exit(1); }
+	if (getline(&message, &max_length, file) == -1) {
+		fprintf(stderr,"CLIENT: ERROR reading file %s\n", argv[1]); exit(1);
+	}
+	if (( newline = strchr(message, '\n' )) != NULL ) {
+		*newline = '\0';
+	}
+	fclose(file);
+
+	// Get key from file
+	key = (char*)malloc(sizeof(char) * max_length);
+	memset(key, '\0', max_length);
+	file = fopen(argv[2], "r");
+	if (!file) { fprintf(stderr,"CLIENT: ERROR opening file %s\n", argv[2]); exit(1); }
+	if (getline(&key, &max_length, file) == -1) {
+		fprintf(stderr,"CLIENT: ERROR reading file %s\n", argv[2]); exit(1);
+	}
+	if (( newline = strchr(key, '\n' )) != NULL ) {
+		*newline = '\0';
+	}
+	fclose(file);
+
+	int msgSize = strlen(message);
+	int keySize = strlen(key);
+	if (msgSize > keySize) { fprintf(stderr,"CLIENT: ERROR, key is smaller than cyphertext\n"); exit(1); } // Check key size
+
+	int i;
+	for (i = 0; i < msgSize; i++) {
+		if (message[i] != 32 && (message[i] < 65 || message[i] > 90)) {
+			fprintf(stderr,"CLIENT: ERROR bad characters present\n"); exit(1);
+		}
+	}
 
 	// Set up the server address struct
 	memset((char*)&serverAddress, '\0', sizeof(serverAddress)); // Clear out the address struct
-	portNumber = atoi(argv[2]); // Get the port number, convert to an integer from a string
+	portNumber = atoi(argv[3]); // Get the port number, convert to an integer from a string
 	serverAddress.sin_family = AF_INET; // Create a network-capable socket
 	serverAddress.sin_port = htons(portNumber); // Store the port number
-	serverHostInfo = gethostbyname(argv[1]); // Convert the machine name into a special form of address
-	if (serverHostInfo == NULL) { fprintf(stderr, "CLIENT: ERROR, no such host\n"); exit(0); }
+	serverHostInfo = gethostbyname("localhost"); // Convert the machine name into a special form of address
+	if (serverHostInfo == NULL) { fprintf(stderr, "CLIENT: ERROR, no such host\n"); exit(2); }
 	memcpy((char*)&serverAddress.sin_addr.s_addr, (char*)serverHostInfo->h_addr, serverHostInfo->h_length); // Copy in the address
 
 	// Set up the socket
@@ -32,26 +73,65 @@ int main(int argc, char *argv[])
 	if (socketFD < 0) error("CLIENT: ERROR opening socket");
 
 	// Connect to server
-	if (connect(socketFD, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0) // Connect socket to address
-		error("CLIENT: ERROR connecting");
+	if (connect(socketFD, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) < 0) { // Connect socket to address
+		fprintf(stderr,"Error: could not contact otp_enc_d on port %d\n", portNumber);
+		exit(2);
+	}
 
-	// Get input message from user
-	printf("CLIENT: Enter text to send to the server, and then hit enter: ");
-	memset(buffer, '\0', sizeof(buffer)); // Clear out the buffer array
-	fgets(buffer, sizeof(buffer) - 1, stdin); // Get input from the user, trunc to buffer - 1 chars, leaving \0
-	buffer[strcspn(buffer, "\n")] = '\0'; // Remove the trailing \n that fgets adds
+	char ok_buf[3];
+	memset(ok_buf,'\0', sizeof(ok_buf));
 
-	// Send message to server
-	charsWritten = send(socketFD, buffer, strlen(buffer), 0); // Write to the server
+	// Send client id to server
+	charsWritten = send(socketFD, "DEC", 3, 0); // Write to the server
 	if (charsWritten < 0) error("CLIENT: ERROR writing to socket");
-	if (charsWritten < strlen(buffer)) printf("CLIENT: WARNING: Not all data written to socket!\n");
+	if (charsWritten < 3) printf("CLIENT: WARNING: Not all data written to socket!\n");
+	charsRead = recv(socketFD, ok_buf, 2, 0); // wait until server sends success message to indicate it is done reading
+	if (charsRead < 0) error("CLIENT: ERROR reading from socket");
+	if (strcmp(ok_buf, "ok") != 0) exit(1);
+
+	char msgSizeCh[6];
+	memset(msgSizeCh,'\0',sizeof(msgSizeCh));
+	sprintf(msgSizeCh, "%d", msgSize);
+
+	// Send message size to server
+	charsWritten = send(socketFD, msgSizeCh, strlen(msgSizeCh), 0); // Write to the server
+	if (charsWritten < 0) error("CLIENT: ERROR writing to socket");
+	if (charsWritten < strlen(msgSizeCh)) printf("CLIENT: WARNING: Not all data written to socket!\n");
+	charsRead = recv(socketFD, ok_buf, 2, 0); // wait until server sends success message to indicate it is done reading
+	if (charsRead < 0) error("CLIENT: ERROR reading from socket");
+
+	// Send cyphertext message to server
+	charsWritten = send(socketFD, message, strlen(message), 0); // Write to the server
+	if (charsWritten < 0) error("CLIENT: ERROR writing to socket");
+	if (charsWritten < strlen(message)) printf("CLIENT: WARNING: Not all data written to socket!\n");
+	charsRead = recv(socketFD, ok_buf, 2, 0); // wait until server sends success message to indicate it is done reading
+	if (charsRead < 0) error("CLIENT: ERROR reading from socket");
+
+	// Send key to server
+	charsWritten = send(socketFD, key, strlen(key), 0); // Write to the server
+	if (charsWritten < 0) error("CLIENT: ERROR writing to socket");
+	if (charsWritten < strlen(key)) printf("CLIENT: WARNING: Not all data written to socket!\n");
+	charsRead = recv(socketFD, ok_buf, 2, 0); // wait until server sends success message to indicate it is done reading
+	if (charsRead < 0) error("CLIENT: ERROR reading from socket");
 
 	// Get return message from server
-	memset(buffer, '\0', sizeof(buffer)); // Clear out the buffer again for reuse
-	charsRead = recv(socketFD, buffer, sizeof(buffer) - 1, 0); // Read data from the socket, leaving \0 at end
-	if (charsRead < 0) error("CLIENT: ERROR reading from socket");
-	printf("CLIENT: I received this from the server: \"%s\"\n", buffer);
+	memset(message, '\0', sizeof(message)); // Clear out the message again for reuse
+	int totalRead = 0;
+	char buffer[1024];
+	while (totalRead < msgSize) {
+		memset(buffer, '\0', 1024);
+		charsRead = recv(socketFD, buffer, 1023, 0); // Read the message from the socket
+		if (charsRead < 1) error("ERROR reading from socket");
+		totalRead += charsRead;
+		strcat(message,buffer);
+	}
+
+	printf("%s\n", message);
+	fflush(stdout);
 
 	close(socketFD); // Close the socket
+	free(message);
+	free(key);
+
 	return 0;
 }

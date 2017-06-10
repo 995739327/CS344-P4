@@ -12,8 +12,13 @@ int main(int argc, char *argv[])
 {
 	int listenSocketFD, establishedConnectionFD, portNumber, charsRead;
 	socklen_t sizeOfClientInfo;
-	char buffer[256];
+	char completeMessage[80000];
+	char key[80000];
+	char buffer[1024];
+	char id_buffer[4];
+	char num_buffer[6];
 	struct sockaddr_in serverAddress, clientAddress;
+	char* client_id = "DEC";
 
 	if (argc != 2) { fprintf(stderr,"USAGE: %s port\n", argv[0]); exit(1); } // Check usage & args
 
@@ -33,21 +38,97 @@ int main(int argc, char *argv[])
 		error("ERROR on binding");
 	listen(listenSocketFD, 5); // Flip the socket on - it can now receive up to 5 connections
 
-	// Accept a connection, blocking if one is not available until one connects
-	sizeOfClientInfo = sizeof(clientAddress); // Get the size of the address for the client that will connect
-	establishedConnectionFD = accept(listenSocketFD, (struct sockaddr *)&clientAddress, &sizeOfClientInfo); // Accept
-	if (establishedConnectionFD < 0) error("ERROR on accept");
+	while (1) {
+		// Accept a connection, blocking if one is not available until one connects
+		sizeOfClientInfo = sizeof(clientAddress); // Get the size of the address for the client that will connect
+		establishedConnectionFD = accept(listenSocketFD, (struct sockaddr *)&clientAddress, &sizeOfClientInfo); // Accept
+		if (establishedConnectionFD < 0) error("ERROR on accept");
 
-	// Get the message from the client and display it
-	memset(buffer, '\0', 256);
-	charsRead = recv(establishedConnectionFD, buffer, 255, 0); // Read the client's message from the socket
-	if (charsRead < 0) error("ERROR reading from socket");
-	printf("SERVER: I received this from the client: \"%s\"\n", buffer);
+		// Fork the process to encrypt the message
+		pid_t pid;
+		pid = fork();
+		if (pid == 0) { // this is the child process
 
-	// Send a Success message back to the client
-	charsRead = send(establishedConnectionFD, "I am the server, and I got your message", 39, 0); // Send success back
-	if (charsRead < 0) error("ERROR writing to socket");
-	close(establishedConnectionFD); // Close the existing socket which is connected to the client
-	close(listenSocketFD); // Close the listening socket
+			int msgSize, i;
+
+			// Get the client id from the client
+			memset(id_buffer, '\0', sizeof(id_buffer));
+			charsRead = recv(establishedConnectionFD, id_buffer, 3, 0); // Read the client's message from the socket
+			if (charsRead < 0) error("ERROR reading from socket");
+			if (strcmp(id_buffer,client_id) != 0) {
+				fprintf(stderr,"Error, connection refused, unauthorized client.\n");
+				send(establishedConnectionFD, "no", 2, 0);
+				exit(1);
+			} // refuse connection id wrong client id
+			charsRead = send(establishedConnectionFD, "ok", 2, 0);
+			if (charsRead < 0) error("ERROR writing to socket");
+
+			// Get message size from client
+			memset(num_buffer, '\0', sizeof(num_buffer));
+			charsRead = recv(establishedConnectionFD, num_buffer, 5, 0); // Read the client's message from the socket
+			if (charsRead < 0) error("ERROR reading from socket");
+			msgSize = atoi(num_buffer);
+
+			// send message to indicate message received
+			charsRead = send(establishedConnectionFD, "ok", 2, 0);
+			if (charsRead < 0) error("ERROR writing to socket");
+
+			// Get the complete cyphertext message
+			int totalRead;
+			while (totalRead < msgSize) {
+				memset(buffer, '\0', 1024);
+				charsRead = recv(establishedConnectionFD, buffer, 1023, 0); // Read the client's message from the socket
+				if (charsRead < 0) error("ERROR reading from socket");
+				totalRead += charsRead;
+				strcat(completeMessage,buffer);
+			}
+
+			// send message to indicate message received
+			charsRead = send(establishedConnectionFD, "ok", 2, 0);
+			if (charsRead < 0) error("ERROR writing to socket");
+
+			// get the key
+			totalRead = 0;
+			while (totalRead < msgSize) {
+				memset(buffer, '\0', 1024);
+				charsRead = recv(establishedConnectionFD, buffer, 1023, 0); // Read the client's message from the socket
+				if (charsRead < 0) error("ERROR reading from socket");
+				if (charsRead == 0) { fprintf(stderr,"Error: key not large enough\n"); exit(1); }
+				totalRead += charsRead;
+				strcat(key,buffer);
+			}
+
+			// send message to indicate message received
+			charsRead = send(establishedConnectionFD, "ok", 2, 0);
+			if (charsRead < 0) error("ERROR writing to socket");
+
+			// Decode the message with the key
+			for (i = 0; i < strlen(completeMessage); i++) {
+				if (completeMessage[i] == 32) completeMessage[i] = 91;
+				if (key[i] == 32) key[i] = 91;
+				completeMessage[i] = (completeMessage[i] - 65 - (key[i] - 65)) % 27;
+				// int r = a % b;
+				if (completeMessage[i] < 0) completeMessage[i] += 27;
+				completeMessage[i] += 65;
+				if (completeMessage[i] == 91) completeMessage[i] = 32;
+			}
+
+			// Send the decoded message back to the client
+			charsRead = send(establishedConnectionFD, completeMessage, strlen(completeMessage), 0);
+			if (charsRead < 0) error("ERROR writing to socket");
+			close(establishedConnectionFD); // Close the existing socket which is connected to the client
+			close(listenSocketFD); // Close the listening socket
+			exit(0);
+
+		} else if (pid < 0) {
+			perror("fork error");
+			fflush(stderr);
+		} else { // this is the parent process
+			waitpid(pid, NULL, WNOHANG);
+		}
+
+	}
+
 	return 0;
+
 }
